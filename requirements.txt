@@ -1,0 +1,38 @@
+# Core scientific stack
+numpy==1.26.4 # Matemáticas base en Python
+pandas==2.2.2 # Manipulación de datos con tablas
+scipy==1.11.4 # Funciones estadísticas, optimización y señales
+matplotlib==3.8.4 # Gráficas básicas
+seaborn==0.13.2 # Visualización más estética
+plotly==5.22.0 # Gráficas interactivas
+
+# Machine Learning / Deep Learning
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121 # Motor de deep learning para entrenar redes neuronales. Aprovechamiento de GPU con CUDA.
+#pip install torch==2.3.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+
+# Reinforcement Learning
+gymnasium==0.29.1 # Estándar para crear entornos RL
+stable-baselines3==2.2.1 # Librería con implementaciones fiables de algoritmos (PPO, SAC, DQN...)
+optuna==3.6.1   # Para buscar automáticamente los mejores hiperparámetros
+
+# Data sources
+yfinance==0.2.40   # Descarga histórica de precios de Yahoo Finance
+
+# Utilities
+tqdm==4.66.4 # Barras de progreso bonitas al entrenar o procesar datos
+pyyaml==6.0.1 # Para leer y guardar configuraciones (config.yaml)
+jaxtyping==0.2.30 # Anotar y validar tensores (ayuda a evitar errores en redes neuronales)
+pydantic==2.8.2 # Validación de datos estructurados (ej: perfil del inversor)
+xlrd==2.0.2 # Convertir .xls a .xlsx
+
+# Jupyter / Notebooks
+jupyterlab==4.2.3
+notebook==7.2.1
+ipywidgets==8.1.3
+
+# Reports
+reportlab==4.2.2 # PDF
+openpyxl==3.1.5 # Excel
+
+#python -m pip install -r requirements.txt

@@ -1,0 +1,36 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Logs y temporales
+*.log
+*.tmp
+*.bak
+
+# === PyCharm / IntelliJ IDEA ===
+.idea/*
+!.idea/modules.xml
+!.idea/vcs.xml
+!.idea/*.iml
+!.idea/inspectionProfiles/
+
+# === Datos del proyecto ===
+data/raw/
+*.zip
+*.csv
+*.xls
+*.xlsx
