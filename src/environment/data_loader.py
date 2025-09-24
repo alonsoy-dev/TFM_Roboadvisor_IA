@@ -1,60 +1,62 @@
 from __future__ import annotations
 import pandas as pd
-from typing import Optional, Iterable
-
+from typing import Tuple
 
 class TimeSeriesFormatError(Exception):
     pass
 
 
-def _auto_date_col(cols: Iterable[str]) -> Optional[str]:
-    candidates = [c for c in cols if c.strip().lower() in {"date"}]
-    return candidates[0] if candidates else None
-
-
-def load_time_series(path_csv: str, date_col: Optional[str] = None) -> pd.DataFrame:
+def load_market_from_long_csv(path_csv: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Lee el CSV de series temporales con precios diarios por ETF.
-    Estructura esperada:
-        date, ETF1, ETF2, ...
-    - 'date' se convierte en índice datetime.
-    - Columnas ETF -> float (no numéricos a NaN).
-    - Fechas únicas, ordenadas asc.
-    - Sin filas totalmente vacías.
-    Devuelve: DataFrame 'prices' con índice DatetimeIndex y columnas = ETFs.
+    Espera columnas: date, ticker, name, type, nav, shares_outstanding, aum
+    Devuelve:
+      prices_df : index=date, columns=ticker, values=nav
+      aum_df    : index=date, columns=ticker, values=aum
+      meta_df   : por ticker -> columns=['name','type']
     """
     df = pd.read_csv(path_csv)
 
-    # 1) Detectar columna de fecha
-    date_col = date_col or _auto_date_col(df.columns)
+    required = {"date", "ticker", "nav", "aum"}
+    missing = required - set(df.columns)
+    if missing:
+        raise TimeSeriesFormatError(f"Faltan columnas requeridas: {missing}")
 
-    # 2) Parseo de fechas e índice
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=False)
-    df = df.dropna(subset=[date_col])
-    df = df.set_index(date_col)
-    df.index.name = "date"
+    # Normaliza tipos
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
+    df = df.dropna(subset=["date", "ticker"])
+    df["ticker"] = df["ticker"].astype(str).str.strip()
 
-    # 3) Orden cronológico y unicidad
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="first")]
+    # A numérico
+    for col in ["nav", "aum"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 4) Convertir columnas a numéricas (coerce -> NaN si hay strings)
-    value_cols = [c for c in df.columns if c is not None]
-    for c in value_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Resolver duplicados por (date, ticker) -> nos quedamos con la última
+    df = (df
+          .sort_values(["date", "ticker"])
+          .groupby(["date", "ticker"], as_index=False)
+          .last())
 
-    # 5) Eliminar filas totalmente vacías
-    df = df.dropna(how="all")
+    prices_df = (df.pivot(index="date", columns="ticker", values="nav").sort_index())
+    aum_df = (df.pivot(index="date", columns="ticker", values="aum").sort_index())
 
-    # 6) Validaciones suaves
-    if df.shape[1] == 0:
-        raise TimeSeriesFormatError("No hay columnas de precios tras limpiar el CSV.")
-    return df
+    # Limpiezas
+    prices_df = prices_df.dropna(how="all")
+    aum_df = aum_df.reindex(prices_df.index)  # alinear por fechas de precios
+
+    # ---- META por ticker (usar df completo, no subset sin 'date') ----
+    meta_cols_exist = [c for c in ["name", "type"] if c in df.columns]
+    if meta_cols_exist:
+        meta_df = (df.sort_values(["ticker", "date"])
+                     .groupby("ticker", as_index=True)
+                     .last()[meta_cols_exist])
+        # Asegura mismo orden/índice que las columnas de precios
+        meta_df = meta_df.reindex(prices_df.columns)
+    else:
+        meta_df = pd.DataFrame(index=prices_df.columns)
+
+    meta_df.index.name = "ticker"
+    return prices_df, aum_df, meta_df
 
 
 def trading_days_from_prices(prices: pd.DataFrame) -> pd.DatetimeIndex:
-    """
-    Devuelve el índice de fechas (ordenado, único) como calendario maestro.
-    """
-    idx = pd.DatetimeIndex(prices.index).unique().sort_values()
-    return idx
+    return pd.DatetimeIndex(prices.index).unique().sort_values()
