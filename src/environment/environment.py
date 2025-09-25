@@ -33,7 +33,8 @@ class PortfolioEnv:
 
     def __init__(self,
                  prices: pd.DataFrame,
-                 profile: InvestorProfile):
+                 profile: InvestorProfile,
+                 aum: pd.DataFrame = None):
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("Se esperaba prices.index como DatetimeIndex.")
         self.prices = prices.copy()
@@ -52,6 +53,9 @@ class PortfolioEnv:
         # Preparamos precios con ffill para valoración
         self._prices_ffill = self.prices.sort_index().ffill()
 
+        # AUM por ETF
+        self._aum_ffill = aum.sort_index().ffill() if aum is not None else None
+
         # Estado
         self._t_idx: int = 0
         self.today: Optional[pd.Timestamp] = None
@@ -64,6 +68,9 @@ class PortfolioEnv:
         # Valores agregados
         self.portfolio_value_usd: float = 0.0
         self.history: list[Dict[str, Any]] = []
+
+        # Estado previo
+        self.prev_portfolio_value_usd: Optional[float] = None
 
     # ---------- Ciclo de vida ----------
     def reset(self,
@@ -102,7 +109,7 @@ class PortfolioEnv:
         self._log_day(contribution_applied=contrib)
         return obs
 
-    def step(self) -> Dict[str, Any]:
+    def step(self, action: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         # Fin de calendario
         if self._t_idx >= len(self.calendar) - 1:
             return self._make_observation(done=True, contribution_applied=0.0)
@@ -117,12 +124,97 @@ class PortfolioEnv:
             contribution_applied = float(self.profile.aportacion_mensual_usd)
             self.cash_usd += contribution_applied
 
+        # Ejecutar la acción a cierre (si viene)
+        if action:
+            self._exec_at_close(target_weights=action)
+
         # Valorizar cartera con precios del día
         self._recalc_portfolio_value()
 
         obs = self._make_observation(contribution_applied=contribution_applied)
         self._log_day(contribution_applied=contribution_applied)
         return obs
+
+    # Ejecución a cierre con all invertido y comisiones por ETF
+    def _exec_at_close(self, target_weights: Dict[str, float]) -> None:
+        """
+        Rebalancea a 'target_weights' usando precios de cierre de self.today.
+        - Sin cortos ni deuda; los pesos se normalizan para que sumen 1 (cero cash final).
+        - Comisión por movimiento por ETF según su AUM del día.
+        - Ajuste previo para que, tras pagar comisiones, quede all invertido.
+        """
+        # Sanitizar: [0,∞) y normalizar a suma 1
+        tw = {t: max(0.0, float(target_weights.get(t, 0.0))) for t in self.universe}
+        total_w = sum(tw.values())
+        if total_w <= 0.0:
+            raise ValueError("target_weights inválido: la suma debe ser > 0 para invertir todo.")
+        tw = {t: w / total_w for t, w in tw.items()}  # suma exacta = 1
+
+        # Precios y valor actual
+        px = {t: self._price_today(t) for t in self.universe}
+        self._recalc_portfolio_value()
+        total_before = float(self.portfolio_value_usd)
+        if not np.isfinite(total_before) or total_before <= 0:
+            return
+
+        current_usd = {}
+        for t in self.universe:
+            sh = self.positions_shares.get(t, 0.0)
+            p = px[t]
+            current_usd[t] = (sh * p) if (pd.notna(p) and sh) else 0.0
+
+        # Fee rate por ETF (según AUM del ETF)
+        fr = {t: self._fee_rate_for_ticker(t) for t in self.universe}
+
+        # Estimación de comisiones y ajuste "neto de fees"
+        delta0 = {t: tw[t] * total_before - current_usd[t] for t in self.universe}
+        fees0 = sum(fr[t] * abs(delta0[t]) for t in self.universe)
+        avail0 = total_before - fees0
+
+        # Target con capital neto de fees
+        delta1 = {t: tw[t] * avail0 - current_usd[t] for t in self.universe}
+        fees1 = sum(fr[t] * abs(delta1[t]) for t in self.universe)
+        avail1 = total_before - fees1
+
+        # Usar la versión ajustada
+        delta = {t: tw[t] * avail1 - current_usd[t] for t in self.universe}
+        fees = sum(fr[t] * abs(delta[t]) for t in self.universe)
+
+        # Operacion de ventas primero (generan cash)
+        sells = {t: -min(0.0, delta[t]) for t in self.universe}  # positivos = vender
+        for t, nom in sells.items():
+            if nom <= 0.0: continue
+            p = px[t]
+            if not pd.notna(p) or p <= 0: continue
+            sh_to_sell = min(self.positions_shares.get(t, 0.0), nom / p)
+            if sh_to_sell > 0:
+                self.positions_shares[t] -= sh_to_sell
+                self.cash_usd += sh_to_sell * p
+
+        # 5) Pagar comisiones (ventas + compras)
+        self.cash_usd -= fees
+        if abs(self.cash_usd) < 1e-10:  # limpieza numérica
+            self.cash_usd = 0.0
+
+        # Compras con el cash restante
+        buys = {t: max(0.0, delta[t]) for t in self.universe}
+        budget = self.cash_usd
+        sum_buys = sum(buys.values())
+        if budget > 0 and sum_buys > 0:
+            scale = budget / sum_buys
+            for t, nom in buys.items():
+                if nom <= 0.0: continue
+                p = px[t]
+                if not pd.notna(p) or p <= 0: continue
+                alloc = nom * scale
+                sh_to_buy = alloc / p
+                if sh_to_buy > 0:
+                    self.positions_shares[t] = self.positions_shares.get(t, 0.0) + sh_to_buy
+                    self.cash_usd -= sh_to_buy * p
+
+        # Dejar cash exactamente a 0 si es residuo minúsculo
+        if abs(self.cash_usd) < 1e-8:
+            self.cash_usd = 0.0
 
     # ---------- Valoración ----------
     def _price_today(self, etf: str) -> float:
@@ -153,6 +245,28 @@ class PortfolioEnv:
                 mv += shares * px
             # Si px es NaN, aportación 0 hoy (no contamos ese ETF hoy)
         self.portfolio_value_usd = self.cash_usd + mv
+
+    def _aum_today(self, etf: str) -> Optional[float]:
+        if self._aum_ffill is None:
+            return None
+        try:
+            val = self._aum_ffill.at[self.today, etf]
+        except KeyError:
+            return None
+        return float(val) if pd.notna(val) else None
+
+    def _fee_rate_for_ticker(self, etf: str) -> float:
+        """
+        Tabla por AUM del ETF (USD)
+        """
+        a = self._aum_today(etf)
+        if a < 100_000_000:
+            return 0.003
+        if a < 500_000_000:
+            return 0.002
+        if a < 2_000_000_000:
+            return 0.001
+        return 0.0005
 
     # ---------- helpers ----------
     def _make_observation(self,
