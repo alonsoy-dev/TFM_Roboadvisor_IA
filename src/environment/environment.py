@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import pandas as pd
 import numpy as np
+from reward_engine import RewardEngine, RewardConfig
 
 from calendar_engine import (
     build_master_calendar,
@@ -31,14 +32,15 @@ class PortfolioEnv:
     - Sin ejecutar compras/ventas aun
     """
 
-    def __init__(self,
-                 prices: pd.DataFrame,
-                 profile: InvestorProfile,
-                 aum: pd.DataFrame = None):
+    def __init__(self, prices, profile, aum=None, exposures=None, reward_engine=None):
+
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("Se esperaba prices.index como DatetimeIndex.")
         self.prices = prices.copy()
         self.profile = profile
+        self.exposures = exposures or {}
+        self.reward_engine = reward_engine or RewardEngine(RewardConfig())
+        self.prev_portfolio_value_usd = None
 
         # Calendario maestro desde las fechas reales de precios
         trading_days = trading_days_from_prices(self.prices)
@@ -105,7 +107,10 @@ class PortfolioEnv:
         # Recalcular valor de cartera
         self._recalc_portfolio_value()
 
+        self.prev_portfolio_value_usd = self.portfolio_value_usd  # base para el primer step
+        reward = 0.0
         obs = self._make_observation(contribution_applied=contrib)
+        obs["reward"] = reward
         self._log_day(contribution_applied=contrib)
         return obs
 
@@ -131,7 +136,19 @@ class PortfolioEnv:
         # Valorizar cartera con precios del día
         self._recalc_portfolio_value()
 
+        score = self.reward_engine.compute(
+            prev_value=self.prev_portfolio_value_usd,
+            curr_value=self.portfolio_value_usd,
+            net_flow=contribution_applied,
+            riesgo=self.profile.riesgo,
+            horizonte_anios=self.profile.horizonte_anios,
+            positions_shares=self.positions_shares,
+            price_today_fn=self._price_today,
+            exposures=self.exposures
+        )
+        self.prev_portfolio_value_usd = self.portfolio_value_usd
         obs = self._make_observation(contribution_applied=contribution_applied)
+        obs["reward"] = score
         self._log_day(contribution_applied=contribution_applied)
         return obs
 
