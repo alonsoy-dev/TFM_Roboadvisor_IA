@@ -4,16 +4,9 @@ from typing import Optional, Dict, Any
 import pandas as pd
 import numpy as np
 from reward_engine import RewardEngine, RewardConfig
-
-from calendar_engine import (
-    build_master_calendar,
-    monthly_contribution_mask,
-    month_end_mask,
-    is_first_business_day_of_month,
-    is_last_business_day_of_month,
-)
+from observation_engine import ObservationEngine
+from calendar_engine import build_master_calendar,monthly_contribution_mask
 from data_loader import trading_days_from_prices
-
 
 @dataclass
 class InvestorProfile:
@@ -40,7 +33,6 @@ class PortfolioEnv:
         self.profile = profile
         self.exposures = exposures or {}
         self.reward_engine = reward_engine or RewardEngine(RewardConfig())
-        self.prev_portfolio_value_usd = None
 
         # Calendario maestro desde las fechas reales de precios
         trading_days = trading_days_from_prices(self.prices)
@@ -48,7 +40,6 @@ class PortfolioEnv:
 
         # Máscaras
         self._is_contribution_day = monthly_contribution_mask(self.calendar)
-        self._is_month_end = month_end_mask(self.calendar)
 
         # Universo = columnas del DataFrame de precios
         self.universe: list[str] = [c for c in self.prices.columns if isinstance(c, str)]
@@ -70,9 +61,14 @@ class PortfolioEnv:
         # Valores agregados
         self.portfolio_value_usd: float = 0.0
         self.history: list[Dict[str, Any]] = []
-
         # Estado previo
         self.prev_portfolio_value_usd: Optional[float] = None
+        self._aportado_acum: float = 0.0
+
+        # Motor de observación
+        self.obs_engine = ObservationEngine(self)
+        self.max_weight_per_fund: Optional[float] = None
+        self._start_date_reset: Optional[pd.Timestamp] = None
 
     # ---------- Ciclo de vida ----------
     def reset(self,
@@ -89,10 +85,12 @@ class PortfolioEnv:
 
         self.calendar = cal
         self._is_contribution_day = monthly_contribution_mask(self.calendar)
-        self._is_month_end = month_end_mask(self.calendar)
 
         self._t_idx = 0
         self.today = self.calendar[self._t_idx]
+
+        # Fijar inicio de episodio para horizonte restante
+        self._start_date_reset = self.today
 
         # Estado financiero
         self.cash_usd = float(self.profile.liquidez_inicial_usd)
@@ -107,11 +105,13 @@ class PortfolioEnv:
         # Recalcular valor de cartera
         self._recalc_portfolio_value()
 
-        self.prev_portfolio_value_usd = self.portfolio_value_usd  # base para el primer step
+        self._aportado_acum = float(self.cash_usd)
+
         reward = 0.0
-        obs = self._make_observation(contribution_applied=contrib)
-        obs["reward"] = reward
-        self._log_day(contribution_applied=contrib)
+        obs = self._make_observation(contribution_applied=contrib, reward=reward, done=False)
+        self.prev_portfolio_value_usd = self.portfolio_value_usd
+        vol0 = self._volatilidad_diaria_actual(lookback_days=120)
+        self._log_day(contribution_applied=contrib, reward=0.0, r_dia=0.0, vol_diaria=vol0)
         return obs
 
     def step(self, action: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
@@ -128,6 +128,7 @@ class PortfolioEnv:
         if self._is_contribution_day.loc[self.today] and self.profile.aportacion_mensual_usd > 0:
             contribution_applied = float(self.profile.aportacion_mensual_usd)
             self.cash_usd += contribution_applied
+            self._aportado_acum += contribution_applied
 
         # Ejecutar la acción a cierre (si viene)
         if action:
@@ -135,6 +136,16 @@ class PortfolioEnv:
 
         # Valorizar cartera con precios del día
         self._recalc_portfolio_value()
+
+        # Volatilidad diaria basada en participaciones actuales
+        vol_diaria = self._volatilidad_diaria_actual(lookback_days=120)
+
+        # Rentabilidad diaria
+        if self.prev_portfolio_value_usd and self.prev_portfolio_value_usd > 0:
+            r_dia = ((self.portfolio_value_usd - contribution_applied) /
+                     self.prev_portfolio_value_usd) - 1.0
+        else:
+            r_dia = 0.0
 
         score = self.reward_engine.compute(
             prev_value=self.prev_portfolio_value_usd,
@@ -144,14 +155,53 @@ class PortfolioEnv:
             horizonte_anios=self.profile.horizonte_anios,
             positions_shares=self.positions_shares,
             price_today_fn=self._price_today,
-            exposures=self.exposures
+            exposures=self.exposures,
+            volatilidad_diaria=vol_diaria,
         )
-        self.prev_portfolio_value_usd = self.portfolio_value_usd
-        obs = self._make_observation(contribution_applied=contribution_applied)
-        obs["reward"] = score
-        self._log_day(contribution_applied=contribution_applied)
-        return obs
 
+        # LOG
+        self._log_day(
+            contribution_applied=contribution_applied,
+            reward=score,
+            r_dia=r_dia,
+            vol_diaria=vol_diaria
+        )
+
+        # Actualizamos el prev para el próximo día
+        self.prev_portfolio_value_usd = self.portfolio_value_usd
+
+        # Delega obs en ObservationEngine
+        return self._make_observation(contribution_applied=contribution_applied, reward=score, done=False)
+
+    def _log_day(self,
+                 contribution_applied: float = 0.0,
+                 reward: float = np.nan,
+                 r_dia: float = None,
+                 vol_diaria: float = None) -> None:
+        """Lo que ve el humano durante el entrenamiento a modo orientativo"""
+
+        valor_hoy = float(self.portfolio_value_usd)
+        rentab_pct = float((r_dia or 0.0) * 100.0)
+        balance_neto = float(valor_hoy - self._aportado_acum)
+        posiciones_pct = self._posiciones_pct(valor_hoy)
+
+        self.history.append({
+            "fecha": self.today,
+            "reward": float(reward),
+            "valor_cartera": valor_hoy,
+            "rentabilidad_diaria(%)": round(rentab_pct, 6),
+            "balance_neto": round(balance_neto, 6),
+            "posiciones(%)": posiciones_pct,
+        })
+
+    def _make_observation(self,
+                          done: bool = False,
+                          contribution_applied: float = 0.0,
+                          reward: float = 0.0) -> Dict[str, Any]:
+        """Lo que ve el agente para entrenarse"""
+        return self.obs_engine.build(done=done, contribution_applied=contribution_applied, reward=reward)
+
+    # ---------- Helpers ----------
     # Ejecución a cierre con all invertido y comisiones por ETF
     def _exec_at_close(self, target_weights: Dict[str, float]) -> None:
         """
@@ -285,32 +335,73 @@ class PortfolioEnv:
             return 0.001
         return 0.0005
 
-    # ---------- helpers ----------
-    def _make_observation(self,
-                          done: bool = False,
-                          contribution_applied: float = 0.0) -> Dict[str, Any]:
-        today = self.today
-        # Snapshot simple de posiciones y valoración
-        positions_copy = {k: float(v) for k, v in self.positions_shares.items() if v != 0.0}
+    def _volatilidad_diaria_actual(self, lookback_days: int = 120) -> float: # Ventana de 6 meses atras
+        """
+        Volatilidad diaria (std) de la cartera usando:
+          - participaciones actuales (self.positions_shares)
+          - precios 'hasta hoy' (self._prices_ffill.loc[:self.today])
+        Convierte participaciones -> pesos con los precios de 'hoy'.
+        """
+        # Ventana hasta hoy
+        if self.today is None:
+            return 0.0
+        px = self._prices_ffill.loc[:self.today]
+        if px.shape[0] < 2:
+            return 0.0
 
-        return {
-            "fecha": today,
-            "es_primer_dia_habil_mes": bool(is_first_business_day_of_month(today, self.calendar)),
-            "es_ultimo_dia_habil_mes": bool(is_last_business_day_of_month(today, self.calendar)),
-            "aportacion_aplicada": contribution_applied,
-            "cash": self.cash_usd,
-            "valor_cartera": self.portfolio_value_usd,
-            "posiciones": positions_copy,
-            "done": done,
-        }
+        # Precios de hoy (última fila de la ventana)
+        last = px.iloc[-1]
+        vals = {}
+        for t, sh in self.positions_shares.items():
+            if not sh:
+                continue
+            p = last.get(t, np.nan)
+            if pd.notna(p) and p > 0:
+                vals[t] = float(sh) * float(p)
 
-    def _log_day(self, contribution_applied: float = 0.0) -> None:
-        self.history.append({
-            "fecha": self.today,
-            "aportacion_aplicada": contribution_applied,
-            "cash": self.cash_usd,
-            "valor_cartera": self.portfolio_value_usd,
-            "es_primer_dia_habil_mes": self._is_contribution_day.loc[self.today],
-            "es_ultimo_dia_habil_mes": self._is_month_end.loc[self.today],
-            "posiciones": {k: float(v) for k, v in self.positions_shares.items() if v != 0.0},
-        })
+        if not vals:
+            return 0.0
+
+        total = sum(vals.values())
+        if total <= 0:
+            return 0.0
+
+        w = pd.Series({t: v / total for t, v in vals.items()}, dtype=float)
+
+        # Rentabilidades diarias de la ventana
+        rets = px.pct_change().dropna()
+        cols = w.index.intersection(rets.columns)
+        if len(cols) == 0:
+            return 0.0
+
+        port = rets[cols] @ w[cols].values  # serie de rentabilidades diarias
+        if port.empty:
+            return 0.0
+
+        tail = port.tail(lookback_days)
+        if tail.shape[0] < 2:
+            return 0.0
+
+        vol = float(tail.std(ddof=1))
+        return vol if np.isfinite(vol) else 0.0
+
+    def _posiciones_pct(self, valor_hoy: float) -> dict:
+        if not np.isfinite(valor_hoy) or valor_hoy <= 0.0:
+            return {}
+        out = {}
+        last_prices = {t: self._price_today(t) for t in self.universe}
+        for t, sh in self.positions_shares.items():
+            if sh <= 0.0:
+                continue
+            p = last_prices.get(t, np.nan)
+            if not pd.notna(p) or p <= 0.0:
+                continue
+            v = sh * p
+            if v > 0.0:
+                out[t] = round(100.0 * v / valor_hoy, 4)
+        # Limpieza numérica: que no pase de 100 por redondeos
+        s = sum(out.values())
+        if 95.0 < s < 105.0 and s != 0.0:
+            k = 100.0 / s
+            out = {t: round(v * k, 4) for t, v in out.items()}
+        return out
