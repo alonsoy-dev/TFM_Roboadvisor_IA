@@ -1,5 +1,6 @@
 from __future__ import annotations
 import pandas as pd
+import numpy as np
 from typing import Tuple
 
 class TimeSeriesFormatError(Exception):
@@ -164,3 +165,64 @@ def get_country_exposure(country_by_ticker: dict[str, pd.DataFrame], ticker: str
 
 def get_sector_exposure(sector_by_ticker: dict[str, pd.DataFrame], ticker: str) -> pd.DataFrame:
     return sector_by_ticker.get(ticker, pd.DataFrame(columns=["sector", "weight"]))
+
+# ------------------ Indicadores precalculados ------------------
+def precompute_indicators(prices: pd.DataFrame) -> dict:
+    """
+    Indicadores precalculados por ticker.
+    Claves:
+      RET_1D, RET_5D, RET_21D, RET_126D,
+      VOL_63D, SMA_20, SMA_120,
+      RSI_14, MACD_HIST_NORM, ATR_14
+    """
+    px = prices.sort_index().copy()
+
+    # Retornos
+    ret1   = px.pct_change(1)
+    ret5   = px.pct_change(5)
+    ret21  = px.pct_change(21)
+    ret126 = px.pct_change(126)
+
+    # Volatilidad 63d y medias
+    vol63  = ret1.rolling(63, min_periods=20).std()
+    sma20  = px.rolling(20,  min_periods=5).mean()
+    sma120 = px.rolling(120, min_periods=20).mean()
+
+    # RSI(14) clásico
+    delta = px.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    alpha = 1/14
+    avg_gain = gain.ewm(alpha=alpha, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi14 = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+
+    # MACD(12,26,9) → histograma normalizado por precio
+    ema12 = px.ewm(span=12, adjust=False).mean()
+    ema26 = px.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = macd_line - signal
+    macd_hist_norm = (macd_hist / px.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # ATR(14) proxy sin OHLC (TR ≈ |Close - Close.shift(1)|)
+    tr = px.diff().abs()
+    atr14 = tr.rolling(14, min_periods=5).mean()
+
+    # Empaquetado por ticker
+    ind: dict = {}
+    for t in px.columns:
+        ind[t] = {
+            "RET_1D": ret1[t],
+            "RET_5D": ret5[t],
+            "RET_21D": ret21[t],
+            "RET_126D": ret126[t],
+            "VOL_63D": vol63[t],
+            "SMA_20": sma20[t],
+            "SMA_120": sma120[t],
+            "RSI_14": rsi14[t],
+            "MACD_HIST_NORM": macd_hist_norm[t],
+            "ATR_14": atr14[t],
+        }
+    return ind

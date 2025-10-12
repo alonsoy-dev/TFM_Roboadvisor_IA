@@ -1,10 +1,11 @@
 from __future__ import annotations
-
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 from math import log10
 
+if TYPE_CHECKING:
+    from src.environment.environment import PortfolioEnv
 
 # ============================================================
 #   ObservationEngine
@@ -25,6 +26,10 @@ class ObservationEngine:
 
     def __init__(self, env: "PortfolioEnv"):
         self.env = env
+        # cache por fecha para evitar repetir cálculo entre n_envs sincronizados
+        self._cache_date = None
+        self._cache_global: Dict[str, Any] | None = None
+        self._cache_por_activo: List[Dict[str, Any]] | None = None
 
     # -------------------- API --------------------
     def build(self,
@@ -34,24 +39,24 @@ class ObservationEngine:
         """Construye el diccionario de observación completo"""
         perfil = self._build_perfil()
         cartera = self._build_cartera(contribution_applied)
-        mercado_global = self._build_mercado_global()
-        mercado_por_activo = self._build_mercado_por_activo()
+
+        if self._cache_date != self.env.today:
+            # Refresca caches de mercado una sola vez por fecha
+            self._cache_global = self._build_mercado_global()
+            self._cache_por_activo = self._build_mercado_por_activo()
+            self._cache_date = self.env.today
+
+        mercado_global = self._cache_global if self._cache_global is not None else {}
+        mercado_por_activo = self._cache_por_activo if self._cache_por_activo is not None else []
 
         return {
             "fecha": self.env.today,
             "perfil": perfil,
             "cartera": cartera,
-            "mercado": {
-                "global": mercado_global,
-                "por_activo": mercado_por_activo,
-            },
+            "mercado": {"global": mercado_global, "por_activo": mercado_por_activo},
             "done": bool(done),
             "reward": float(reward),
         }
-
-    # ============================================================
-    #                         BLOQUES
-    # ============================================================
 
     # -------------------- PERFIL --------------------
     def _build_perfil(self) -> Dict[str, Any]:
@@ -61,13 +66,11 @@ class ObservationEngine:
         # horizonte restante (meses): meses_restantes/meses_totales -> 2x-1
         meses_totales = max(1, int(e.profile.horizonte_anios) * 12)
         meses_pasados = max(0, self._meses_transcurridos())
-        meses_restantes = max(0, meses_totales - meses_pasados)
-        h01 = meses_restantes / meses_totales
+        h01 = max(0.0, (meses_totales - meses_pasados) / meses_totales)
         horizonte_pm1 = self._to_pm1_from_01(h01)
         # aportación mensual relativa a liquidez inicial -> 2x-1
         liq0 = max(1.0, float(e.profile.liquidez_inicial_usd))
-        aport01 = self._cap(float(e.profile.aportacion_mensual_usd) / liq0, 0.0, 1.0)
-        aport_pm1 = self._to_pm1_from_01(aport01)
+        aport_pm1 = self._to_pm1_from_01(self._cap(float(e.profile.aportacion_mensual_usd) / liq0, 0.0, 1.0))
 
         return {
             "riesgo": float(self._cap(riesgo_pm1, -1.0, 1.0)),
@@ -80,15 +83,12 @@ class ObservationEngine:
         e = self.env
 
         w_dict, w_cash = self._weights_today()
-        pesos_list = [{"ticker": t, "peso": self._to_pm1_from_01(w_dict.get(t, 0.0))}
-                      for t in e.universe]
-
+        pesos_list = [{"ticker": t, "peso": self._to_pm1_from_01(w_dict.get(t, 0.0))} for t in e.universe]
         liquidez_pm1 = self._to_pm1_from_01(self._cap(w_cash, 0.0, 1.0))
 
-        # valor_cartera relativo a liquidez inicial -> cap (0..3x) -> 2x-1
-        equity_rel = self._portfolio_equity_indexed()
-        eq01 = self._cap(equity_rel / 3.0, 0.0, 1.0)
-        valor_cartera_pm1 = self._to_pm1_from_01(eq01)
+        # valor_cartera relativo a liquidez inicial
+        equity_rel = self._portfolio_equity_indexed()  # cartera / liquidez_inicial
+        valor_cartera_pm1 = self._to_pm1_from_01(self._cap(equity_rel / 3.0, 0.0, 1.0))
 
         div01 = self._diversificacion_from_w(w_dict)
         top3_01 = self._top3_concentration_from_w(w_dict)
@@ -96,15 +96,10 @@ class ObservationEngine:
 
         # drawdown 63d de la cartera (aprox con pesos actuales)
         drawdown_pm1 = self._drawdown_cartera_63d_pm1(w_dict)
-
-        # límite máx por fondo
         wmax = getattr(e, "max_weight_per_fund", None)
-        if wmax is None:
-            limite_pm1 = 0.0
-        else:
-            limite_pm1 = self._to_pm1_from_01(self._cap(float(wmax), 0.0, 1.0))
+        limite_pm1 = self._to_pm1_from_01(self._cap(float(wmax), 0.0, 1.0)) if wmax is not None else 0.0
 
-        # rentabilidad de ayer neta de aportación de ayer (cap ±5%) -> [-1,1]
+        # rentabilidad de ayer neta de aportación de ayer
         rentab_1d_lag_pm1 = self._rentab_cartera_1d_lag(contribution_applied)
 
         return {
@@ -150,6 +145,20 @@ class ObservationEngine:
     # ============================================================
     #                      HELPERS INTERNOS
     # ============================================================
+    def _get_ind(self, ticker: str, name: str, default: float = 0.0) -> float:
+        """Lookup O(1) del indicador precalculado para la fecha actual."""
+        ind_t = self.env.indicators.get(ticker)
+        if not ind_t:
+            return float(default)
+        s = ind_t.get(name)
+        if s is None or not isinstance(s, pd.Series):
+            return float(default)
+        val = s.get(self.env.today, default)
+        try:
+            x = float(val)
+            return x if np.isfinite(x) else float(default)
+        except Exception:
+            return float(default)
 
     @staticmethod
     def _cap(x: float, lo: float, hi: float) -> float:
@@ -158,62 +167,6 @@ class ObservationEngine:
     @staticmethod
     def _to_pm1_from_01(x01: float) -> float:
         return 2.0 * float(x01) - 1.0
-
-    @staticmethod
-    def _safe_pct_change(series: pd.Series, periods: int) -> float:
-        if len(series) <= periods:
-            return 0.0
-        px_t = float(series.iloc[-1])
-        px_tp = float(series.iloc[-1 - periods])
-        if not np.isfinite(px_t) or not np.isfinite(px_tp) or px_tp == 0.0:
-            return 0.0
-        return (px_t / px_tp) - 1.0
-
-    @staticmethod
-    def _rolling_std_pct(series: pd.Series, window: int) -> float:
-        if series.shape[0] < window + 1:
-            return 0.0
-        rets = series.pct_change().dropna()
-        if rets.shape[0] < window:
-            return 0.0
-        return float(rets.tail(window).std(ddof=1))
-
-    @staticmethod
-    def _sma(series: pd.Series, window: int) -> float:
-        if series.shape[0] < window:
-            return float(series.mean()) if series.shape[0] > 0 else 0.0
-        return float(series.tail(window).mean())
-
-    @staticmethod
-    def _rsi_14_from_prices(series: pd.Series) -> float:
-        if series.shape[0] < 15:
-            return 50.0
-        delta = series.diff().dropna()
-        up = np.where(delta > 0, delta, 0.0)
-        dn = np.where(delta < 0, -delta, 0.0)
-        up = pd.Series(up, index=delta.index).rolling(14).mean()
-        dn = pd.Series(dn, index=delta.index).rolling(14).mean()
-        rs = up.iloc[-1] / dn.iloc[-1] if dn.iloc[-1] != 0 else np.inf
-        rsi = 100.0 - (100.0 / (1.0 + rs)) if np.isfinite(rs) else 100.0
-        return float(ObservationEngine._cap(rsi, 0.0, 100.0))
-
-    @staticmethod
-    def _atr_14_from_close(close: pd.Series) -> float:
-        if close.shape[0] < 15:
-            return 0.0
-        tr = close.diff().abs()
-        return float(tr.rolling(14).mean().iloc[-1]) if tr.shape[0] >= 14 else 0.0
-
-    @staticmethod
-    def _macd_hist_from_close(close: pd.Series) -> float:
-        if close.shape[0] < 35:
-            return 0.0
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        hist = macd - signal
-        return float(hist.iloc[-1])
 
     # --- pesos y derivados ---
     def _weights_today(self) -> Tuple[Dict[str, float], float]:
@@ -262,7 +215,7 @@ class ObservationEngine:
         return float(ObservationEngine._cap(s3, 0.0, 1.0))
 
     def _peso_rv_from_w(self, w: Dict[str, float]) -> float:
-        tipos = self.env.exposures["type_sector"]  # dict {ticker -> 'Equity'/'FixedIncome'}
+        tipos = self.env.exposures.get("type_sector", {})  # 'Equity'/'FixedIncome'
         return sum(wi for t, wi in w.items() if tipos.get(t) == "Equity")
 
     # --- equity / drawdown / retornos ---
@@ -302,103 +255,91 @@ class ObservationEngine:
         r = ((float(e.portfolio_value_usd) - float(contribution_applied)) / float(pv_prev)) - 1.0
         return float(self._cap(r / self._RCAP_1D, -1.0, 1.0))
 
-    # --- indicadores por activo ---
+    # --- indicadores por activo (lookups) ---
     def _ret_k_cap_pm1(self, ticker: str, k: int, cap_abs: float) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        r = self._safe_pct_change(px, k)
+        key = {1: "RET_1D", 5: "RET_5D", 21: "RET_21D", 126: "RET_126D"}.get(k)
+        if key is None:
+            return 0.0
+        r = self._get_ind(ticker, key, default=0.0)
         return float(self._cap(r / cap_abs, -1.0, 1.0))
 
     def _vol_63d_pm1(self, ticker: str) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        vol = self._rolling_std_pct(px, 63)
-        x01 = self._cap(vol / 0.03, 0.0, 1.0)  # cap 3% diario
+        vol = self._get_ind(ticker, "VOL_63D", default=0.0)
+        x01 = self._cap(vol / 0.03, 0.0, 1.0)
         return self._to_pm1_from_01(x01)
 
     def _gap_ma_pm1(self, ticker: str, n: int, cap_abs: float) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        if px.shape[0] < n + 1:
+        px = self.env._price_today(ticker)
+        if not (px and px > 0.0):
             return 0.0
-        ma = self._sma(px, n)
-        if ma <= 0.0:
+        sma_key = "SMA_20" if n == 20 else ("SMA_120" if n == 120 else None)
+        if sma_key is None:
             return 0.0
-        gap = (float(px.iloc[-1]) - ma) / ma
+        ma = self._get_ind(ticker, sma_key, default=np.nan)
+        if not np.isfinite(ma) or ma <= 0.0:
+            return 0.0
+        gap = (float(px) - float(ma)) / float(ma)
         return float(self._cap(gap / cap_abs, -1.0, 1.0))
 
     def _rsi_14_pm1(self, ticker: str) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        rsi = self._rsi_14_from_prices(px)  # 0..100
+        rsi = self._get_ind(ticker, "RSI_14", default=50.0)  # 0..100
         return float((rsi / 50.0) - 1.0)
 
     def _atr14_pm1(self, ticker: str) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        if px.shape[0] < 15:
+        atr = self._get_ind(ticker, "ATR_14", default=0.0)
+        price = self.env._price_today(ticker)
+        if not (price and price > 0.0):
             return 0.0
-        atr = self._atr_14_from_close(px)
-        price = float(px.iloc[-1]) if px.shape[0] > 0 else 0.0
-        if price <= 0.0:
-            return 0.0
-        atr_rel = max(0.0, float(atr) / price)
+        atr_rel = max(0.0, float(atr) / float(price))
         x01 = self._cap(atr_rel / self._ATR_CAP, 0.0, 1.0)
         return self._to_pm1_from_01(x01)
 
     def _macd_hist_norm_pm1(self, ticker: str) -> float:
-        px = self.env._prices_ffill.loc[:self.env.today, ticker].dropna()
-        if px.shape[0] < 35:
-            return 0.0
-        hist = self._macd_hist_from_close(px)
-        atr = self._atr_14_from_close(px)
-        denom = atr if atr and atr > 0.0 else (0.01 * float(px.iloc[-1]))
-        x = hist / denom
+        x = self._get_ind(ticker, "MACD_HIST_NORM", default=0.0)
         return float(self._cap(x / 3.0, -1.0, 1.0))
 
     def _aum_pm1(self, ticker: str) -> float:
         a = self.env._aum_today(ticker)
         if a is None or not np.isfinite(a) or a <= 0.0:
             return 0.0
-        # log10(AUM) cap [7,12] -> 0..1 -> [-1,1]
         x = self._cap(log10(a), 7.0, 12.0)
         x01 = (x - 7.0) / 5.0
         return self._to_pm1_from_01(x01)
 
     # --- globales ---
     def _vol_global_63d_pm1(self) -> float:
-        vols = []
-        for t in self.env.universe:
-            px = self.env._prices_ffill.loc[:self.env.today, t].dropna()
-            vols.append(self._rolling_std_pct(px, 63))
+        vols = [self._get_ind(t, "VOL_63D", default=np.nan) for t in self.env.universe]
+        vols = [v for v in vols if np.isfinite(v)]
         if not vols:
             return 0.0
-        mean_vol = float(np.nanmean(vols))
-        x01 = self._cap(mean_vol / 0.03, 0.0, 1.0)  # cap 3% diario
+        mean_vol = float(np.mean(vols))
+        x01 = self._cap(mean_vol / 0.03, 0.0, 1.0)
         return self._to_pm1_from_01(x01)
 
     def _amplitud_universo_ma120_pm1(self) -> float:
-        ups = 0
-        tot = 0
+        ups, tot = 0, 0
         for t in self.env.universe:
-            px = self.env._prices_ffill.loc[:self.env.today, t].dropna()
-            if px.shape[0] < 121:
+            px = self.env._price_today(t)
+            if not (px and px > 0.0):
                 continue
-            ma = self._sma(px, 120)
-            if ma <= 0.0:
+            ma120 = self._get_ind(t, "SMA_120", default=np.nan)
+            if not np.isfinite(ma120) or ma120 <= 0.0:
                 continue
             tot += 1
-            if float(px.iloc[-1]) > ma:
+            if float(px) > float(ma120):
                 ups += 1
-        raw = (ups / tot) if tot > 0 else 0.5  # neutral si faltan datos
+        raw = (ups / tot) if tot > 0 else 0.5
         return self._to_pm1_from_01(self._cap(raw, 0.0, 1.0))
 
     def _correlacion_media_3m_pm1(self) -> float:
         px = self.env._prices_ffill.loc[:self.env.today, self.env.universe].dropna(how='all')
-        if px.shape[0] < 64:
+        if px.shape[0] < 64 or px.shape[1] < 2:
             return 0.0
         rets = px.pct_change().dropna().tail(63)
         if rets.shape[0] < 2 or rets.shape[1] < 2:
             return 0.0
         C = rets.corr().values
         n = C.shape[0]
-        if n < 2:
-            return 0.0
         vals = [C[i, j] for i in range(n) for j in range(i + 1, n)]
         m = float(np.nanmean(vals)) if vals else 0.0
         return float(self._cap(m, -1.0, 1.0))

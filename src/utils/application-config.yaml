@@ -1,0 +1,7 @@
+paths:
+  time_series:       "{}"
+  exposures_country: "{}"
+  exposures_sector:  "{}"
+  reports_dir:       "{}"
+  runs_dir:          "{}"
+  logs_dir:          "{}"

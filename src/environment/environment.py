@@ -3,10 +3,10 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import pandas as pd
 import numpy as np
-from reward_engine import RewardEngine, RewardConfig
-from observation_engine import ObservationEngine
-from calendar_engine import build_master_calendar,monthly_contribution_mask
-from data_loader import trading_days_from_prices
+from src.environment.reward_engine import RewardEngine, RewardConfig
+from src.environment.observation_engine import ObservationEngine
+from src.environment.calendar_engine import build_master_calendar, monthly_contribution_mask
+from src.environment.data_loader import trading_days_from_prices
 
 @dataclass
 class InvestorProfile:
@@ -25,13 +25,14 @@ class PortfolioEnv:
     - Sin ejecutar compras/ventas aun
     """
 
-    def __init__(self, prices, profile, aum=None, exposures=None, reward_engine=None):
+    def __init__(self, prices, profile, aum=None, exposures=None, indicators=None, reward_engine=None):
 
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("Se esperaba prices.index como DatetimeIndex.")
         self.prices = prices.copy()
         self.profile = profile
-        self.exposures = exposures or {}
+        self.exposures = exposures
+        self.indicators = indicators
         self.reward_engine = reward_engine or RewardEngine(RewardConfig())
 
         # Calendario maestro desde las fechas reales de precios
