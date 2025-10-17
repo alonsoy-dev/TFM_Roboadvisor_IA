@@ -102,6 +102,14 @@ class ObservationEngine:
         # rentabilidad de ayer neta de aportación de ayer
         rentab_1d_lag_pm1 = self._rentab_cartera_1d_lag(contribution_applied)
 
+        reward_cfg = self.env.reward_engine.cfg
+        # Límite máximo de volatilidad del perfil de riesgo, normalizado
+        risk_limit_pm1 = self._to_pm1_from_01(
+            self._cap(reward_cfg.risk_limit_vol_table.get(e.profile.riesgo) / 0.015, 0.0, 1.0))
+        # Volatilidad ideal según el horizonte, normalizada
+        ideal_vol_h_pm1 = self._to_pm1_from_01(
+            self._cap(self.env.reward_engine._interp_horizon_target_vol(e.profile.horizonte_anios) / 0.015, 0.0, 1.0))
+
         return {
             "pesos": pesos_list,
             "liquidez": float(liquidez_pm1),
@@ -112,6 +120,8 @@ class ObservationEngine:
             "drawdown_3_meses": float(drawdown_pm1),
             "limite_max_por_fondo": float(limite_pm1),
             "rentabilidad_1d_lag": float(rentab_1d_lag_pm1),
+            "risk_limit_target": float(risk_limit_pm1),
+            "horizon_vol_target": float(ideal_vol_h_pm1),
         }
 
     # -------------------- MERCADO (GLOBAL) --------------------
