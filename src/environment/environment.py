@@ -7,6 +7,7 @@ from src.environment.reward_engine import RewardEngine, RewardConfig
 from src.environment.observation_engine import ObservationEngine
 from src.environment.calendar_engine import build_master_calendar, monthly_contribution_mask
 from src.environment.data_loader import trading_days_from_prices
+from src.environment.metrics_engine import MetricsEngine
 
 @dataclass
 class InvestorProfile:
@@ -34,6 +35,8 @@ class PortfolioEnv:
         self.exposures = exposures
         self.indicators = indicators
         self.reward_engine = reward_engine or RewardEngine(RewardConfig())
+
+        self.metrics_engine = MetricsEngine(short_window=30, long_window=252)
 
         # Calendario maestro desde las fechas reales de precios
         trading_days = trading_days_from_prices(self.prices)
@@ -90,8 +93,10 @@ class PortfolioEnv:
         self._t_idx = 0
         self.today = self.calendar[self._t_idx]
 
-        # Fijar inicio de episodio para horizonte restante
-        self._start_date_reset = self.today
+        # Metrics: reset con el perfil de riesgo del episodio
+        self.metrics_engine.reset(risk_profile=int(self.profile.riesgo))
+
+        self.metrics_engine.reset(risk_profile=int(self.profile.riesgo))
 
         # Estado financiero
         self.cash_usd = float(self.profile.liquidez_inicial_usd)
@@ -118,7 +123,9 @@ class PortfolioEnv:
     def step(self, action: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         # Fin de calendario
         if self._t_idx >= len(self.calendar) - 1:
-            return self._make_observation(done=True, contribution_applied=0.0)
+            obs = self._make_observation(done=True, contribution_applied=0.0)
+            obs['custom_metrics'] = {}
+            return obs
 
         # Avanza día
         self._t_idx += 1
@@ -160,6 +167,10 @@ class PortfolioEnv:
             volatilidad_diaria=vol_diaria,
         )
 
+        # Metrics: actualizar buffers y construir métricas para el paso
+        self.metrics_engine.update(r_net=r_dia)
+        metrics = self.metrics_engine.get_metrics()
+
         # LOG
         self._log_day(
             contribution_applied=contribution_applied,
@@ -171,8 +182,14 @@ class PortfolioEnv:
         # Actualizamos el prev para el próximo día
         self.prev_portfolio_value_usd = self.portfolio_value_usd
 
-        # Delega obs en ObservationEngine
-        return self._make_observation(contribution_applied=contribution_applied, reward=score, done=False)
+        # Delegar la creación de la observación
+        obs = self._make_observation(
+            contribution_applied=contribution_applied,
+            reward=score,
+            done=False,)
+        # Adjuntar el diccionario de métricas a la salida del step
+        obs['custom_metrics'] = metrics
+        return obs
 
     def _log_day(self,
                  contribution_applied: float = 0.0,

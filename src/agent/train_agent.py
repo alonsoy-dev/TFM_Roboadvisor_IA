@@ -8,7 +8,7 @@ from dateutil.relativedelta import relativedelta
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
 
 # --- Importaciones del proyecto ---
 from src.environment.data_loader import load_time_series_csv, load_all_exposures, precompute_indicators
@@ -40,6 +40,44 @@ def setup_data_and_sampler():
 
     print(f"Histórico de datos completo cargado con éxito.")
     return prices, aum, exposures, sampler, indicators
+
+
+# Warm-up durante una fracción del aprendizaje del fold 1 (warm_frac=0.2 -> 20% del fold)
+def make_lr_schedule(base=3e-4, warm=1e-5, warm_frac=0.2):
+    def schedule(progress_remaining):
+        t = 1.0 - progress_remaining  # 0 -> 1
+        if t < warm_frac:
+            return warm + (base - warm) * (t / warm_frac)
+        return base
+
+    return schedule
+
+
+def make_clip_schedule(start=0.1, end=0.2, warm_frac=0.2):
+    def schedule(progress_remaining):
+        t = 1.0 - progress_remaining
+        if t < warm_frac:
+            return start + (end - start) * (t / warm_frac)
+        return end
+
+    return schedule
+
+class RewardMetricsTB(BaseCallback):
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", None)
+        if not infos:
+            return True
+        for info in infos:
+            m = info.get("reward_metrics")
+            if not m:
+                continue
+            for k, v in m.items():
+                try:
+                    self.logger.record(f"reward/{k}", float(v))
+                except Exception:
+                    pass
+        return True
+
 
 # ==============================================================================
 # BLOQUE PRINCIPAL DE EJECUCIÓN CON WALK-FORWARD
@@ -122,18 +160,22 @@ if __name__ == '__main__':
         # CREACIÓN O CARGA DEL MODELO (TRANSFER LEARNING)
         fold_model_name = f"PPO_Fold_{current_year}"
 
-        RESUME_CHECKPOINT = r"/file_path"
+        RESUME_CHECKPOINT = configYaml.paths.run_checkpoint
 
         if model is None:
             if os.path.exists(RESUME_CHECKPOINT):
                 print(f"Reanudando desde checkpoint inicial: {RESUME_CHECKPOINT}")
                 model = PPO.load(RESUME_CHECKPOINT, env=vec_env, device="cuda")
+                model.learning_rate = make_lr_schedule(1e-4, 1e-5, 0.2)
+                if hasattr(model, "clip_range"):
+                    model.clip_range = make_clip_schedule(0.1, 0.2, 0.2)
+                model.target_kl = None
             else:
-                # Primer fold: creamos el modelo desde cero
                 print("Primer fold: Creando un nuevo modelo PPO...")
-                # Arquitectura de la red neuronal (el "cerebro" del agente)
+                # Arquitectura de la red neuronal
                 policy_kwargs = dict(
-                    activation_fn=th.nn.Tanh, # Se usa Tanh para suavizar la salida de las neuronas, útil en entornos ruidosos.
+                    activation_fn=th.nn.Tanh,
+                    # Se usa Tanh para suavizar la salida de las neuronas, útil en entornos ruidosos.
                     net_arch=dict(
                         pi=[256, 256],
                         vf=[256, 256]
@@ -144,24 +186,28 @@ if __name__ == '__main__':
                     "MlpPolicy",  # Política estándar para datos vectoriales
                     vec_env,  # Entorno de entrenamiento paralelizado
                     policy_kwargs=policy_kwargs,
-                    n_steps=1024,  # Pasos por entorno antes de actualizar la red: 1024 * 8 env = 8192 steps
+                    n_steps=4096,  # Pasos por entorno antes de actualizar la red
                     batch_size=256,  # Tamaño del lote para la actualización del gradiente
-                    n_epochs=5,  # Veces que se recorre el buffer de datos en cada actualización
+                    n_epochs=4,  # Veces que se recorre el buffer de datos en cada actualización
                     gamma=0.995,  # Factor de descuento (importancia de recompensas futuras)
                     gae_lambda=0.95,  # Parámetro del estimador de ventaja
-                    ent_coef=0.015,  # Coeficiente de entropía (fuerza de la exploración)
-                    learning_rate=3e-4,  # Tasa de aprendizaje
-                    target_kl=0.03,  # corta updates cuando KL sube demasiado
+                    ent_coef=0.02,  # Coeficiente de entropía (fuerza de la exploración)
+                    learning_rate=make_lr_schedule(1e-4, 1e-5, 0.2 ),  # Tasa de aprendizaje
+                    clip_range=make_clip_schedule(0.1, 0.2, 0.2),
+                    target_kl=None,  # corta updates cuando KL sube demasiado
                     verbose=1,  # Nivel de detalle en la consola (1 = muestra progreso)
                     tensorboard_log=LOGS_DIR,  # Directorio para guardar los logs de TensorBoard
-                    device = 'cuda' # Explicitamente usa la GPU NVIDIA
+                    device='cuda' # Explicitamente usa la GPU NVIDIA
                 )
         else:  # Folds siguientes: cargamos el modelo anterior y lo adaptamos (fine-tuning)
             print("Cargando el modelo del fold anterior para continuar el entrenamiento (fine-tuning)...")
             # Reutilizamos los pesos aprendidos, pero con el nuevo entorno de datos expandido
             model.set_env(vec_env)
             # Para el fine-tuning, es buena práctica reducir aún más la tasa de aprendizaje.
-            model.learning_rate = 3e-5
+            model.learning_rate = lambda progress_remaining: 1e-5
+            if hasattr(model, "clip_range"):
+                model.clip_range = lambda progress_remaining: 0.2
+            model.target_kl = None
 
         # CONFIGURACIÓN DE CALLBACKS PARA EL FOLD ACTUAL
         # El EvalCallback guarda el mejor modelo encontrado durante las evaluaciones periódicas.
@@ -173,11 +219,13 @@ if __name__ == '__main__':
             deterministic=True, render=False
         )
 
+        callback = CallbackList([RewardMetricsTB(), eval_callback])
+
         try:
             # ENTRENAMIENTO DEL FOLD
             model.learn(
                 total_timesteps=TIMESTEPS_PER_FOLD,
-                callback=eval_callback,
+                callback=callback,
                 tb_log_name=f"WalkForward_{current_year}",
                 reset_num_timesteps=False  # Importante para que el log de TensorBoard sea continuo
             )

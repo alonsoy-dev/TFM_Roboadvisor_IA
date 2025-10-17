@@ -46,7 +46,8 @@ class PortfolioGymWrapper(gym.Env):
         v_cartera_num = [
             c["liquidez"], c["valor_cartera"], c["diversificacion"],
             c["concentracion_top3"], c["peso_renta_variable"],
-            c["drawdown_3_meses"], c["limite_max_por_fondo"], c["rentabilidad_1d_lag"]
+            c["drawdown_3_meses"], c["limite_max_por_fondo"], c["rentabilidad_1d_lag"],
+            c["risk_limit_target"], c["horizon_vol_target"]
         ]
         pesos_dict = {p["ticker"]: p["peso"] for p in c.get("pesos", [])}
         v_pesos = [pesos_dict.get(t, -1.0) for t in self.universe]
@@ -85,14 +86,16 @@ class PortfolioGymWrapper(gym.Env):
         w = np.clip(np.asarray(action, dtype=np.float32), 0.0, None)
         s = float(w.sum())
         if s <= 0.0:
-            obs = self.core.step(action=None)
+            full_obs_dict = self.core.step(action=None)
         else:
             w /= s
             action_dict = {t: float(w[i]) for i, t in enumerate(self.universe)}
-            obs = self.core.step(action=action_dict)
+            full_obs_dict = self.core.step(action=action_dict)
 
-        vec = self._flatten_obs(obs)
-        reward = float(obs["reward"])
-        terminated = bool(obs["done"])
+        vec = self._flatten_obs(full_obs_dict)
+        reward = float(full_obs_dict["reward"])
+        terminated = bool(full_obs_dict["done"])
         truncated = False
-        return vec, reward, terminated, truncated, {}
+        info = {'reward_metrics': full_obs_dict.get('custom_metrics', {})}
+
+        return vec, reward, terminated, truncated, info

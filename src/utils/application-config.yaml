@@ -5,3 +5,5 @@ paths:
   reports_dir:       "{}"
   runs_dir:          "{}"
   logs_dir:          "{}"
+  run_checkpoint:    "{}"
+  model_zip:         "{}"
