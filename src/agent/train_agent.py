@@ -17,6 +17,7 @@ from src.environment.data_loader import load_time_series_csv, load_all_exposures
 from src.utils.config_file import configYaml
 from src.agent.profile_sampler import ProfileSampler
 from src.agent.env_gym_wrapper import PortfolioGymWrapper
+from src.environment.reward_engine import RewardEngine, RewardConfig
 
 # ==============================================================================
 # FUNCIÓN DE CONFIGURACIÓN DEL ENTORNO
@@ -37,14 +38,14 @@ def setup_data_and_sampler():
     indicators = precompute_indicators(prices)
 
     # Instanciar el ProfileSampler para la domain randomization
-    sampler = ProfileSampler(seed=123)
+    sampler = ProfileSampler(rng = np.random.default_rng())
 
     print(f"Histórico de datos completo cargado con éxito.")
     return prices, aum, exposures, sampler, indicators
 
 
 # Warm-up durante una fracción del aprendizaje del fold 1 (warm_frac=0.2 -> 20% del fold)
-def make_lr_schedule(base=3e-4, warm=1e-5, warm_frac=0.2):
+def make_lr_schedule(base=1e-4, warm=3e-5, warm_frac=0.3):
     def schedule(progress_remaining):
         t = 1.0 - progress_remaining  # 0 -> 1
         if t < warm_frac:
@@ -54,7 +55,7 @@ def make_lr_schedule(base=3e-4, warm=1e-5, warm_frac=0.2):
     return schedule
 
 
-def make_clip_schedule(start=0.1, end=0.2, warm_frac=0.2):
+def make_clip_schedule(start=0.2, end=0.3, warm_frac=0.3):
     def schedule(progress_remaining):
         t = 1.0 - progress_remaining
         if t < warm_frac:
@@ -74,10 +75,21 @@ class RewardMetricsTB(BaseCallback):
                 continue
             for k, v in m.items():
                 try:
-                    self.logger.record(f"reward/{k}", float(v))
+                    # Clasificación por grupos
+                    group = "reward"
+                    if k in ("risk_penalty_factor", "hard_risk_violation", "daily_volatility", "risk_limit"):
+                        group = "risk"
+                    elif k in ("w_equity", "rv_align", "rv_coverage"):
+                        group = "rv"
+                    elif k in ("hhi", "n_active"):
+                        group = "concentration"
+                    elif k in ("turnover_L1", "n_trades", "trade_penalty"):
+                        group = "trading"
+
+                    self.logger.record(f"{group}/{k}", float(v))
                 except Exception:
                     pass
-        return True
+            return True
 
 
 # ==============================================================================
@@ -98,21 +110,20 @@ if __name__ == '__main__':
     # --- CONFIGURACIÓN GENERAL ---
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
     LOGS_DIR = configYaml.paths.logs_dir
-    RUNS_DIR = os.path.join(configYaml.paths.runs_dir, f"WalkForward_{TIMESTAMP}")
+    RUNS_DIR = os.path.join(configYaml.paths.runs_dir, f"Training_{TIMESTAMP}")
     os.makedirs(RUNS_DIR, exist_ok=True)
 
     N_ENVS = 8
 
     # --- PARÁMETROS DEL WALK-FORWARD ---
-    INITIAL_TRAIN_YEARS = 6  # Empezamos entrenando con 6 años de datos
-    START_YEAR = 2010
+    WINDOW_YEARS = 5   # Empezamos entrenando con 6 años de datos
+    START_YEAR = 2013
     END_TRAIN_YEAR = 2022  # Último año que se incluirá en un set de entrenamiento
     VALIDATION_MONTHS = 12  # Cada fold valida sobre los siguientes 12 meses
-    TIMESTEPS_PER_FOLD = 491_520 # Pasos de entrenamiento en CADA fold
+    TIMESTEPS_PER_FOLD = 500000 # Pasos de entrenamiento en CADA fold
 
     RESUME_FROM_YEAR = 2022
     RESUME_CHECKPOINT = configYaml.paths.run_checkpoint
-    RESUME_VECNORM = configYaml.paths.resume_vecnorm
 
     # --- CARGA DE DATOS COMPLETOS ---
     all_prices, all_aum, exposures, sampler, all_indicators = setup_data_and_sampler()
@@ -124,27 +135,25 @@ if __name__ == '__main__':
     # Variable para guardar la ruta a las estadísticas de normalización
     last_stats_path = None
 
-    for current_year in range(START_YEAR + INITIAL_TRAIN_YEARS, END_TRAIN_YEAR + 1):
+    for current_year in range(START_YEAR + WINDOW_YEARS, END_TRAIN_YEAR + 1):
 
-        if current_year < RESUME_FROM_YEAR:
-            # Avanzamos la ventana, pero no entrenamos ni evaluamos
-            last_stats_path = RESUME_VECNORM  # nos preparamos para que el 2018 cargue estas stats si existen
-            continue
 
         # DIVISIÓN DINÁMICA DE DATOS PARA EL FOLD ACTUAL
+        train_start_date = pd.Timestamp(f'{current_year - WINDOW_YEARS}-09-01')
         train_end_date = pd.Timestamp(f'{current_year}-09-01') - pd.Timedelta(days=1)
         eval_end_date = train_end_date + relativedelta(months=VALIDATION_MONTHS)
 
         print("\n" + "=" * 50)
         print(f" INICIANDO FOLD: {current_year}")
-        print(f"   - Datos de Entrenamiento: {start_date.year} -> {train_end_date.year}")
-        print(f"   - Datos de Validación:    {train_end_date.year + 1}")
+        print(f"   - Train: {train_start_date.year} -> {train_end_date.year}")
+        print(f"   - Test : {train_end_date.year + 1}")
         print("=" * 50 + "\n")
 
         # Filtramos los DataFrames para este fold específico
         fold_prices = all_prices.loc[start_date:eval_end_date]
         fold_aum = all_aum.loc[start_date:eval_end_date]
 
+        reward_engine = RewardEngine(RewardConfig())
         fold_model_name = f"PPO_Fold_{current_year}"
 
         # CREACIÓN DE ENTORNOS PARA EL FOLD ACTUAL
@@ -153,7 +162,8 @@ if __name__ == '__main__':
             'aum': fold_aum,
             'exposures': exposures,
             'sampler': sampler,
-            'indicators': all_indicators
+            'indicators': all_indicators,
+            'reward_engine': reward_engine
         }
 
         # Entorno de entrenamiento con datos hasta train_end_date
@@ -179,31 +189,12 @@ if __name__ == '__main__':
             env_kwargs=eval_env_kwargs
         )
 
-        # Lógica para cargar o crear VecNormalize
-        if last_stats_path and os.path.exists(last_stats_path):
-            # --- FOLDS 2 Y SIGUIENTES ---
-            print(f"Cargando estadísticas de VecNormalize desde: {last_stats_path}")
-            vec_env = VecNormalize.load(last_stats_path, train_vec)
-            eval_env = VecNormalize.load(last_stats_path, raw_eval_env)
-
-            # Re-configuramos los wrappers para el nuevo fold de fine-tuning
-            vec_env.training = True  # Queremos que las estadísticas (media/std) sigan adaptándose
-            vec_env.norm_reward = True  # Queremos seguir normalizando la recompensa de train
-            eval_env.training = False  # El entorno de eval nunca debe actualizar estadísticas
-            eval_env.norm_reward = False  # El entorno de eval nunca debe normalizar la recompensa
-        else:
-            # --- PRIMER FOLD ---
-            print("Primer fold: Creando nuevas estadísticas de VecNormalize.")
-            # VecNormalize para normalizar las observaciones
-            vec_env = VecNormalize(train_vec, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-            eval_env = VecNormalize(raw_eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
-            print("Stats de VecNormalize inicializadas; train=training=True, eval congelado.")
+        # ---- VecNormalize NUEVO por fold (estadísticos del tramo reciente) ----
+        vec_env = VecNormalize(train_vec, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+        eval_env = VecNormalize(raw_eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
         train_norm = vec_env
         eval_norm = eval_env
-
-        # Aplicar VecMonitor: wrapper esencial para que TensorBoard pueda registrar las recompensas
-        # Este wrapper debe ir después del VecNormalize
         vec_env = VecMonitor(vec_env)
         eval_env = VecMonitor(eval_env)
 
@@ -214,41 +205,13 @@ if __name__ == '__main__':
             if os.path.exists(RESUME_CHECKPOINT):
                 print(f"Reanudando desde checkpoint inicial: {RESUME_CHECKPOINT}")
                 model = PPO.load(RESUME_CHECKPOINT, env=vec_env, device="cuda")
-                model.learning_rate = make_lr_schedule(3e-4, 3e-5, 0.5)
-                if hasattr(model, "clip_range"):
-                    model.clip_range = make_clip_schedule(0.08, 0.15, 0.5)
-                    model.target_kl = 0.015
-                if RESUME_FROM_YEAR == 2022:
-                    print("!! INFO: Aplicando 'jolt' de entropía para desatascar el agente.")
-                    model.policy.optimizer = th.optim.Adam(model.policy.parameters(), lr=1.5e-4, eps=1e-5)
-                    # jolt SUAVE (no agresivo)
-                    model.lr_schedule = (lambda _: 1.5e-4)
-                    for g in model.policy.optimizer.param_groups: g["lr"] = 1.5e-4
-                    model.clip_range = (lambda _: 0.20)
-                    model.target_kl = 0.03
-                    model.ent_coef = 0.02
-                    model.n_epochs = 3
-                    model.batch_size=1024
-                    model.n_steps=2048
-                    model._setup_model()
-                    policy_kwargs = dict(
-                        # Se usa Tanh para suavizar la salida de las neuronas, útil en entornos ruidosos.
-                        activation_fn=th.nn.Tanh,
-                        net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                        optimizer_class=th.optim.Adam,
-                        optimizer_kwargs=dict(eps=1e-5)
-                    )
-                    model.policy_kwargs=policy_kwargs
+                model.learning_rate = make_lr_schedule(3e-5, 1e-5, 0.2)
 
-
-                else:
-                    model.ent_coef = 0.02  # Valor normal
             else:
                 print("Primer fold: Creando un nuevo modelo PPO...")
                 # Arquitectura de la red neuronal
                 policy_kwargs = dict(
-                    # Se usa Tanh para suavizar la salida de las neuronas, útil en entornos ruidosos.
-                    activation_fn=th.nn.Tanh,
+                    activation_fn=th.nn.SiLU,
                     net_arch=dict(pi=[128, 128],vf=[128, 128]),
                     optimizer_class = th.optim.Adam,
                     optimizer_kwargs = dict(eps=1e-5)
@@ -264,10 +227,11 @@ if __name__ == '__main__':
                     gamma=0.995,  # Factor de descuento (importancia de recompensas futuras)
                     gae_lambda=0.95,  # Parámetro del estimador de ventaja
                     ent_coef=0.02,  # Coeficiente de entropía (fuerza de la exploración)
-                    learning_rate=make_lr_schedule(1e-4, 1e-5, 0.2 ),  # Tasa de aprendizaje
-                    clip_range=make_clip_schedule(0.08, 0.15, 0.2),
-                    target_kl=0.02,  # Corta updates cuando KL sube demasiado. Mecanismo de seguridad adicional para PPO-Clip
+                    learning_rate=make_lr_schedule(3e-5, 1e-5, 0.2 ),  # Tasa de aprendizaje
+                    clip_range=make_clip_schedule(0.2, 0.1, 0.2),
+                    #target_kl=0.05,  # Corta updates cuando KL sube demasiado. Mecanismo de seguridad adicional para PPO-Clip
                     max_grad_norm=0.5, # Recorta el gradiente si es demasiado grande, previniendo un update explosivo que desestabilice toda la red
+                    use_sde=True, # Para exploración en acciones continuas
                     verbose=1,  # Nivel de detalle en la consola (1 = muestra progreso)
                     tensorboard_log=LOGS_DIR,  # Directorio para guardar los logs de TensorBoard
                     device='cuda' # Explicitamente usa la GPU NVIDIA
@@ -309,7 +273,7 @@ if __name__ == '__main__':
             model.learn(
                 total_timesteps=TIMESTEPS_PER_FOLD,
                 callback=callback,
-                tb_log_name=f"WalkForward_{current_year}",
+                tb_log_name=f"Training_{current_year}",
                 reset_num_timesteps=False  # Importante para que el log de TensorBoard sea continuo
             )
         finally:
@@ -317,10 +281,6 @@ if __name__ == '__main__':
             final_model_path = os.path.join(RUNS_DIR, f"{fold_model_name}_final_interrupt.zip")
             model.save(final_model_path)
             print(f"Modelo de interrupción guardado en: {final_model_path}")
-
-        # Al terminar el fold: guarda las stats del normalizator de train
-        last_stats_path = os.path.join(RUNS_DIR, f"{fold_model_name}_vecnormalize.pkl")
-        train_norm.save(last_stats_path)
 
         # Cargamos el mejor modelo de este fold (guardado por EvalCallback) para la siguiente iteración
         best_model_path = os.path.join(RUNS_DIR, fold_model_name, 'best_model.zip')

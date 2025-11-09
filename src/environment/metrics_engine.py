@@ -19,6 +19,9 @@ class MetricsEngine:
         self.long_window = int(long_window)
         self._ret_daily_buf: List[float] = []
         self._risk_profile: Optional[int] = None
+        self._extras = {}
+        self._anual_trades = 0
+        self._days_elapsed = 0
 
     # ---------- ciclo de vida episodio ----------
     def reset(self, risk_profile: int) -> None:
@@ -41,6 +44,52 @@ class MetricsEngine:
         mu = float(np.mean(x))
         sd = float(np.std(x, ddof=1))
         return mu, sd
+
+    def step_day_counter(self) -> None:
+        self._days_elapsed += 1
+
+    def set_reward(self, final_reward: float) -> None:
+        self._extras["final_reward"] = float(final_reward)
+
+    def update_trading(self, n_trades: int, n_etfs: int) -> None:
+        self._extras["n_trades"] = int(n_trades)
+        self._extras["n_etfs"] = int(n_etfs)
+        self._anual_trades += int(n_trades)
+        # proyección anual simple 252*día
+        if self._days_elapsed > 0:
+            tpd = self._anual_trades / self._days_elapsed
+            self._extras["trades_per_year"] = round(tpd * 252, 2)
+
+    def set_risk_limits(self, risk_limit: float, hard_tol: float) -> None:
+        self._extras["risk_limit"] = float(risk_limit)
+        self._extras["hard_vol_tolerance"] = float(hard_tol)
+
+    def set_risk_diagnostics(self, sigma_d: float, risk_limit: float) -> None:
+        if risk_limit > 0:
+            self._extras["volatility_target_ratio"] = round(float(sigma_d / risk_limit), 6)
+            self._extras["excess_volatility"] = max(0.0, float(sigma_d - risk_limit))
+
+    def set_equity_and_alignment(self, w_equity: float, rv_align: float) -> None:
+        self._extras["equity_percent"] = round(100.0 * float(w_equity), 2)
+        self._extras["rv_align"] = float(rv_align)
+
+    def set_concentration(self, hhi: float) -> None:
+        self._extras["hhi"] = float(hhi)
+
+    def set_divers_country_sector(self, score: float) -> None:
+        self._extras["div_country_sector"] = float(score)
+
+    def set_trade_penalty(self, trade_penalty: float) -> None:
+        self._extras["trade_penalty"] = float(trade_penalty)
+
+    def get_short_volatility(self) -> float:
+        """Devuelve la volatilidad diaria (ventana corta) ya calculada internamente a partir de r_net."""
+        buf = self._ret_daily_buf
+        win_short = buf[-self.short_window:] if len(buf) >= self.short_window else buf
+        if len(win_short) < 2:
+            return 0.0
+        _, sd = self._stats(win_short)
+        return float(sd)
 
     # ---------- consulta de métricas ----------
     def get_metrics(self) -> Dict[str, float]:
@@ -66,7 +115,7 @@ class MetricsEngine:
         else:
             anual_rent_net = 0.0
 
-        return {
+        out = {
             "risk_profile": int(self._risk_profile) if self._risk_profile is not None else -1,
             "daily_rent_net": float(buf[-1]) if buf else 0.0,
             "daily_volatility": float(daily_volatility),
@@ -75,3 +124,7 @@ class MetricsEngine:
             "anual_volatility": float(anual_volatility),
             "anual_sharpe": float(anual_sharpe),
         }
+        for k, v in self._extras.items():
+            if k not in out:
+                out[k] = float(v)
+        return out

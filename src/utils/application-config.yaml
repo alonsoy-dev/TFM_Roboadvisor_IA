@@ -7,3 +7,4 @@ paths:
   logs_dir:          "{}"
   run_checkpoint:    "{}"
   model_zip:         "{}"
+  indexa_capital:    "{}"

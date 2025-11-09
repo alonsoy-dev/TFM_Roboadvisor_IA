@@ -12,6 +12,7 @@ class PortfolioGymWrapper(gym.Env):
 
     def __init__(self, prices, aum, exposures, sampler: ProfileSampler,
                  indicators: dict = None,
+                 reward_engine=None,
                  start_date_limit: pd.Timestamp = None,
                  end_date_limit: pd.Timestamp = None):
         super().__init__()
@@ -20,6 +21,7 @@ class PortfolioGymWrapper(gym.Env):
         self.exposures = exposures
         self.sampler = sampler
         self.indicators = indicators
+        self.reward_engine = reward_engine
         self.start_date_limit = start_date_limit
         self.end_date_limit = end_date_limit
 
@@ -36,7 +38,7 @@ class PortfolioGymWrapper(gym.Env):
     # ---------- helpers ----------
     def _build_core(self):
         profile = self.sampler()
-        self.core = PortfolioEnv(prices=self.prices, profile=profile, aum=self.aum, exposures=self.exposures, indicators=self.indicators)
+        self.core = PortfolioEnv(prices=self.prices, profile=profile, aum=self.aum, exposures=self.exposures, indicators=self.indicators, reward_engine=self.reward_engine)
 
     def _flatten_obs(self, obs):
         perfil = obs["perfil"]
@@ -44,10 +46,21 @@ class PortfolioGymWrapper(gym.Env):
 
         c = obs["cartera"]
         v_cartera_num = [
-            c["liquidez"], c["valor_cartera"], c["diversificacion"],
-            c["concentracion_top3"], c["peso_renta_variable"],
-            c["drawdown_3_meses"], c["limite_max_por_fondo"], c["rentabilidad_1d_lag"],
-            c["risk_limit_target"], c["horizon_vol_target"]
+            c["liquidez"],
+            c["valor_cartera"],
+            c["diversificacion"],
+            c["concentracion_top3"],
+            c["peso_renta_variable"],
+            c["drawdown_3_meses"],
+            c["limite_max_por_fondo"],
+            c["rentabilidad_1d_lag"],
+            c["risk_limit_target"],
+            c["volatilidad_cartera"],
+            c["equity_target"],
+            c["equity_band_lo"],
+            c["equity_band_hi"],
+            c["hhi_target"],
+            c["horizon_risk_scalar"]
         ]
         pesos_dict = {p["ticker"]: p["peso"] for p in c.get("pesos", [])}
         v_pesos = [pesos_dict.get(t, -1.0) for t in self.universe]
@@ -80,22 +93,27 @@ class PortfolioGymWrapper(gym.Env):
 
     # ---------- API Gym ----------
     def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(int(seed))
         return self._reset_core()
 
     def step(self, action):
-        w = np.clip(np.asarray(action, dtype=np.float32), 0.0, None)
-        s = float(w.sum())
-        if s <= 0.0:
-            full_obs_dict = self.core.step(action=None)
+        # Acción válida y sin negativos
+        w = np.asarray(action, dtype=np.float32)
+        w = np.clip(w, 0.0, None)
+        # Suma de pesos
+        s = float(np.nansum(w))
+        if not np.isfinite(s) or s <= 0.0:
+            w = np.ones(len(self.universe), dtype=np.float32) / float(len(self.universe))
         else:
             w /= s
-            action_dict = {t: float(w[i]) for i, t in enumerate(self.universe)}
-            full_obs_dict = self.core.step(action=action_dict)
+        action_dict = {t: float(w[i]) for i, t in enumerate(self.universe)}
+        full_obs_dict = self.core.step(action=action_dict)
 
         vec = self._flatten_obs(full_obs_dict)
         reward = float(full_obs_dict["reward"])
         terminated = bool(full_obs_dict["done"])
         truncated = False
-        info = {'reward_metrics': full_obs_dict.get('custom_metrics', {})}
+        info = {'reward_metrics': full_obs_dict.get('reward_metrics')}
 
         return vec, reward, terminated, truncated, info
