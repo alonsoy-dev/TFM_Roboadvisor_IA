@@ -69,6 +69,10 @@ class PortfolioEnv:
         self.prev_portfolio_value_usd: Optional[float] = None
         self._aportado_acum: float = 0.0
 
+        self._last_weights: dict[str, float] = {etf: 0.0 for etf in self.universe}
+        self._last_trade_count: int = 0
+        self._n_etfs: int = 0
+
         # Motor de observación
         self.obs_engine = ObservationEngine(self)
         self.max_weight_per_fund: Optional[float] = None
@@ -96,8 +100,6 @@ class PortfolioEnv:
         # Metrics: reset con el perfil de riesgo del episodio
         self.metrics_engine.reset(risk_profile=int(self.profile.riesgo))
 
-        self.metrics_engine.reset(risk_profile=int(self.profile.riesgo))
-
         # Estado financiero
         self.cash_usd = float(self.profile.liquidez_inicial_usd)
         self.positions_shares = {etf: 0.0 for etf in self.universe}  # sin posiciones al inicio
@@ -111,13 +113,14 @@ class PortfolioEnv:
         # Recalcular valor de cartera
         self._recalc_portfolio_value()
 
+        vol_diaria_inicial = self._volatilidad_diaria_actual(lookback_days=120)
+
         self._aportado_acum = float(self.cash_usd)
 
         reward = 0.0
-        obs = self._make_observation(contribution_applied=contrib, reward=reward, done=False)
+        obs = self._make_observation(contribution_applied=contrib, reward=reward, done=False, volatilidad_diaria_cartera=vol_diaria_inicial)
         self.prev_portfolio_value_usd = self.portfolio_value_usd
-        vol0 = self._volatilidad_diaria_actual(lookback_days=120)
-        self._log_day(contribution_applied=contrib, reward=0.0, r_dia=0.0, vol_diaria=vol0)
+
         return obs
 
     def step(self, action: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
@@ -138,15 +141,23 @@ class PortfolioEnv:
             self.cash_usd += contribution_applied
             self._aportado_acum += contribution_applied
 
-        # Ejecutar la acción a cierre (si viene)
+        w_prev_for_trades = self._weights_today_simple()
+
         if action:
-            self._exec_at_close(target_weights=action)
+            # acción en 0..1 agrupada
+            tw = {t: max(0.0, float(action.get(t, 0.0))) for t in self.universe}
+            s = sum(tw.values())
+            if s > 0:
+                tw = {t: w / s for t, w in tw.items()}
+                # inercia para reducir oscilación
+                tw = self._smooth_action(tw, beta=0.4)
+                # Top-K por perfil (hard)
+                tw = self._project_topk_by_risk(tw, eps=1e-12)
+                # ejecuta con comisiones
+                self._exec_at_close(target_weights=tw)
 
         # Valorizar cartera con precios del día
         self._recalc_portfolio_value()
-
-        # Volatilidad diaria basada en participaciones actuales
-        vol_diaria = self._volatilidad_diaria_actual(lookback_days=120)
 
         # Rentabilidad diaria
         if self.prev_portfolio_value_usd and self.prev_portfolio_value_usd > 0:
@@ -155,7 +166,26 @@ class PortfolioEnv:
         else:
             r_dia = 0.0
 
-        score = self.reward_engine.compute(
+        # Actualizar métricas de retorno y contador de día
+        self.metrics_engine.update(r_net=r_dia)
+        self.metrics_engine.step_day_counter()
+
+        # Volatilidad diaria basada en cartera (rolling)
+        vol_diaria = self._volatilidad_diaria_actual(lookback_days=120)
+
+        w_today = self._weights_today_simple()
+        n_trades, n_etfs = self._compute_turnover_and_active(w_prev_for_trades, w_today, eps_trade=1e-5)
+        self._last_weights = w_today
+        self._last_trade_count = n_trades
+        self._n_etfs = n_etfs
+
+        # Límites de riesgo
+        limit = self.reward_engine.cfg.risk_limit_vol_table[int(self.profile.riesgo)]
+        tol   = getattr(self.reward_engine.cfg, "hard_vol_tolerance", 0.05)  # 5% por defecto
+        self.metrics_engine.set_risk_limits(risk_limit=limit, hard_tol=tol)
+
+        # Recompensa y diagnósticos
+        score, diag = self.reward_engine.compute(
             prev_value=self.prev_portfolio_value_usd,
             curr_value=self.portfolio_value_usd,
             net_flow=contribution_applied,
@@ -165,11 +195,26 @@ class PortfolioEnv:
             price_today_fn=self._price_today,
             exposures=self.exposures,
             volatilidad_diaria=vol_diaria,
+            n_trades=n_trades,
+            n_etfs=n_etfs,
+            weights_today=w_today,
         )
 
-        # Metrics: actualizar buffers y construir métricas para el paso
-        self.metrics_engine.update(r_net=r_dia)
-        metrics = self.metrics_engine.get_metrics()
+        # Registrar diagnósticos en MetricsEngine
+        self.metrics_engine.set_reward(score)
+        self.metrics_engine.set_risk_diagnostics(sigma_d=vol_diaria, risk_limit=limit)
+        self.metrics_engine.update_trading(n_trades=n_trades, n_etfs=n_etfs)
+        self.metrics_engine.set_equity_and_alignment(w_equity=diag.get("w_equity", 0.0), rv_align=diag.get("rv_align", 0.0))
+        self.metrics_engine.set_concentration(hhi=diag.get("hhi", 0.0))
+        self.metrics_engine.set_divers_country_sector(score=diag.get("div_country_sector", 0.0))
+        self.metrics_engine.set_trade_penalty(trade_penalty=diag.get("trade_penalty", 0.0))
+
+        hard_violation = (vol_diaria > (1.0 + tol) * limit)
+        if hard_violation:
+            # Termina el episodio
+            obs = self._make_observation(contribution_applied=contribution_applied, reward=score, done=True, volatilidad_diaria_cartera=vol_diaria)
+            obs['reward_metrics'] = self.metrics_engine.get_metrics()
+            return obs
 
         # LOG
         self._log_day(
@@ -181,14 +226,9 @@ class PortfolioEnv:
 
         # Actualizamos el prev para el próximo día
         self.prev_portfolio_value_usd = self.portfolio_value_usd
-
         # Delegar la creación de la observación
-        obs = self._make_observation(
-            contribution_applied=contribution_applied,
-            reward=score,
-            done=False,)
-        # Adjuntar el diccionario de métricas a la salida del step
-        obs['custom_metrics'] = metrics
+        obs = self._make_observation(contribution_applied=contribution_applied, reward=score, done=False, volatilidad_diaria_cartera=vol_diaria)
+        obs['reward_metrics'] = self.metrics_engine.get_metrics()
         return obs
 
     def _log_day(self,
@@ -215,9 +255,11 @@ class PortfolioEnv:
     def _make_observation(self,
                           done: bool = False,
                           contribution_applied: float = 0.0,
-                          reward: float = 0.0) -> Dict[str, Any]:
+                          reward: float = 0.0,
+                          volatilidad_diaria_cartera: float = 0.0
+                          ) -> Dict[str, Any]:
         """Lo que ve el agente para entrenarse"""
-        return self.obs_engine.build(done=done, contribution_applied=contribution_applied, reward=reward)
+        return self.obs_engine.build(done=done, contribution_applied=contribution_applied, reward=reward, volatilidad_diaria_cartera=volatilidad_diaria_cartera)
 
     # ---------- Helpers ----------
     # Ejecución a cierre con all invertido y comisiones por ETF
@@ -242,6 +284,9 @@ class PortfolioEnv:
         if not np.isfinite(total_before) or total_before <= 0:
             return
 
+        # Capturar pesos previos
+        w_prev = self._weights_today_simple()
+
         current_usd = {}
         for t in self.universe:
             sh = self.positions_shares.get(t, 0.0)
@@ -263,6 +308,11 @@ class PortfolioEnv:
 
         # Usar la versión ajustada
         delta = {t: tw[t] * avail1 - current_usd[t] for t in self.universe}
+        #Evitar trades de cantidad reducida
+        for t, change in delta.items():
+            if 0 < abs(change) < 100:
+                delta[t] = 0.0
+        #Caclcular comisiones
         fees = sum(fr[t] * abs(delta[t]) for t in self.universe)
 
         # Operacion de ventas primero (generan cash)
@@ -423,3 +473,54 @@ class PortfolioEnv:
             k = 100.0 / s
             out = {t: round(v * k, 4) for t, v in out.items()}
         return out
+
+    def _weights_today_simple(self) -> dict[str, float]:
+        # pesos de cartera hoy (sin cash), idéntica lógica a _posiciones_pct pero en 0..1
+        self._recalc_portfolio_value()
+        total = float(self.portfolio_value_usd)
+        if total <= 0.0: return {}
+        w = {}
+        for t, sh in self.positions_shares.items():
+            if sh <= 0.0: continue
+            p = self._price_today(t)
+            if pd.notna(p) and p > 0.0:
+                v = sh * p
+                if v > 0.0: w[t] = v
+        s = sum(w.values())
+        return {t: v / s for t, v in w.items()} if s > 0 else {}
+
+    def _compute_turnover_and_active(self, w_prev: dict[str, float], w_curr: dict[str, float],
+                                     eps_trade: float = 1e-4) -> tuple[ int, int]:
+        keys = set(w_prev) | set(w_curr)
+        trades = 0
+        active = 0
+        for t in keys:
+            a, b = w_prev.get(t, 0.0), w_curr.get(t, 0.0)
+            diff = abs(a - b)
+            if diff > eps_trade:
+                trades += 1
+            if b > 1e-6:
+                active += 1
+        return int(trades), int(active)
+
+    # ---------- Guardarraíles de ejecución ----------
+    def _project_topk_by_risk(self, weights_target: dict[str, float], eps: float = 1e-6) -> dict[str, float]:
+        """Recorta a Top-K según perfil y renormaliza a 1; filtra polvo < eps."""
+        k = int(self.reward_engine.cfg.max_assets_by_risk[int(self.profile.riesgo)])
+        wt = {t: w for t, w in weights_target.items() if w > eps}
+        if len(wt) <= k:
+            s = sum(wt.values())
+            return {t: w / s for t, w in wt.items()} if s > 0 else {}
+        top = sorted(wt.items(), key=lambda x: x[1], reverse=True)[:k]
+        s = sum(w for _, w in top)
+        return {t: w / s for t, w in top} if s > 0 else {}
+
+    def _smooth_action(self, target: dict[str, float], beta: float = 0.4) -> dict[str, float]:
+        """Inercia de ejecución: mezcla target con pesos actuales para reducir ráfagas."""
+        w_prev = self._weights_today_simple()
+        keys = set(target) | set(w_prev)
+        sm = {t: beta * target.get(t, 0.0) + (1 - beta) * w_prev.get(t, 0.0) for t in keys}
+        # recorte de negativos y renormalizar
+        sm = {t: max(0.0, v) for t, v in sm.items()}
+        s = sum(sm.values())
+        return {t: v / s for t, v in sm.items()} if s > 0 else {}

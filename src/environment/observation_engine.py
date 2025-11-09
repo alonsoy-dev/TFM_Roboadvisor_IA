@@ -35,10 +35,12 @@ class ObservationEngine:
     def build(self,
               done: bool = False,
               contribution_applied: float = 0.0,
-              reward: float = 0.0) -> Dict[str, Any]:
+              reward: float = 0.0,
+              volatilidad_diaria_cartera: float = 0.0
+              ) -> Dict[str, Any]:
         """Construye el diccionario de observación completo"""
         perfil = self._build_perfil()
-        cartera = self._build_cartera(contribution_applied)
+        cartera = self._build_cartera(contribution_applied, volatilidad_diaria_cartera)
 
         if self._cache_date != self.env.today:
             # Refresca caches de mercado una sola vez por fecha
@@ -79,8 +81,12 @@ class ObservationEngine:
         }
 
     # -------------------- CARTERA --------------------
-    def _build_cartera(self, contribution_applied: float) -> Dict[str, Any]:
+    def _build_cartera(self, contribution_applied: float,
+                       volatilidad_diaria_cartera: float
+                       ) -> Dict[str, Any]:
         e = self.env
+        reward_cfg = self.env.reward_engine.cfg
+        riesgo_perfil = e.profile.riesgo
 
         w_dict, w_cash = self._weights_today()
         pesos_list = [{"ticker": t, "peso": self._to_pm1_from_01(w_dict.get(t, 0.0))} for t in e.universe]
@@ -93,22 +99,37 @@ class ObservationEngine:
         div01 = self._diversificacion_from_w(w_dict)
         top3_01 = self._top3_concentration_from_w(w_dict)
         peso_rv01 = self._peso_rv_from_w(w_dict)
-
-        # drawdown 63d de la cartera (aprox con pesos actuales)
         drawdown_pm1 = self._drawdown_cartera_63d_pm1(w_dict)
         wmax = getattr(e, "max_weight_per_fund", None)
         limite_pm1 = self._to_pm1_from_01(self._cap(float(wmax), 0.0, 1.0)) if wmax is not None else 0.0
-
         # rentabilidad de ayer neta de aportación de ayer
         rentab_1d_lag_pm1 = self._rentab_cartera_1d_lag(contribution_applied)
-
-        reward_cfg = self.env.reward_engine.cfg
         # Límite máximo de volatilidad del perfil de riesgo, normalizado
         risk_limit_pm1 = self._to_pm1_from_01(
             self._cap(reward_cfg.risk_limit_vol_table.get(e.profile.riesgo) / 0.015, 0.0, 1.0))
-        # Volatilidad ideal según el horizonte, normalizada
-        ideal_vol_h_pm1 = self._to_pm1_from_01(
-            self._cap(self.env.reward_engine._interp_horizon_target_vol(e.profile.horizonte_anios) / 0.015, 0.0, 1.0))
+
+        # Volatilidad de cartera observada
+        # Normalizamos usando 0.015 como el max_vol
+        vol_cartera_pm1 = self._to_pm1_from_01(self._cap(volatilidad_diaria_cartera / 0.015, 0.0, 1.0) )
+
+        # Objetivos de Renta Variable
+        (eq_lo, eq_hi, eq_t) = reward_cfg.equity_bands_by_risk.get(riesgo_perfil, (0.0, 1.0, 0.5))
+        equity_target_pm1 = self._to_pm1_from_01(self._cap(eq_t, 0.0, 1.0))
+        equity_lo_pm1 = self._to_pm1_from_01(self._cap(eq_lo, 0.0, 1.0))
+        equity_hi_pm1 = self._to_pm1_from_01(self._cap(eq_hi, 0.0, 1.0))
+
+        # Objetivo de HHI
+        hhi_t = reward_cfg.hhi_target_by_risk.get(riesgo_perfil, 0.12)
+        # Normalizamos HHI por un cap de 0.5 (un HHI de 0.5 ya es muy concentrado)
+        hhi_target_pm1 = self._to_pm1_from_01(self._cap(hhi_t / 0.5, 0.0, 1.0))
+
+        # Escalar de Horizonte s(h)
+        h_years = e.profile.horizonte_anios
+        s_h = reward_cfg.s_h(h_years)
+        s_h_norm_01 = self._cap(
+            (s_h - reward_cfg.s_h_short) / (reward_cfg.s_h_long - reward_cfg.s_h_short),
+            0.0, 1.0)
+        horizon_scalar_pm1 = self._to_pm1_from_01(s_h_norm_01)
 
         return {
             "pesos": pesos_list,
@@ -121,7 +142,14 @@ class ObservationEngine:
             "limite_max_por_fondo": float(limite_pm1),
             "rentabilidad_1d_lag": float(rentab_1d_lag_pm1),
             "risk_limit_target": float(risk_limit_pm1),
-            "horizon_vol_target": float(ideal_vol_h_pm1),
+
+            "volatilidad_cartera": float(vol_cartera_pm1),
+            "equity_target": float(equity_target_pm1),
+            "equity_band_lo": float(equity_lo_pm1),
+            "equity_band_hi": float(equity_hi_pm1),
+            "hhi_target": float(hhi_target_pm1),
+
+            "horizon_risk_scalar": float(horizon_scalar_pm1)
         }
 
     # -------------------- MERCADO (GLOBAL) --------------------
